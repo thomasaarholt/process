@@ -1,15 +1,30 @@
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple, Union, overload
+from typing import Callable, Literal, Optional, Tuple, Union, overload
 
+import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import polars as pl
+import sympy as sp
 import xgboost as xgb
 from sklearn import preprocessing
-
-import numpy as np
 from sklearn.preprocessing import OrdinalEncoder
+from sympy.core import Expr, Symbol, symbols
+from scipy import special
+try:
+    raise ImportError
+    from rich import print
+    blue = "[bold #00b8ff]"
+    red = "[bold #ff0024]"
+    green = "[bold #0ef139]"
+    yellow = "[bold #fbf704]"
+except ImportError:
+    blue = "\t"
+    red = "\t"
+    green = "\t"
+    yellow = ""
 
 numeric_categorical_columns = [
     "B_30",
@@ -26,7 +41,7 @@ numeric_categorical_columns = [
 ]
 
 string_categorical_column_prefix = "diff_cat"
-no_diff_columns = ["Year", "Month", "Day", "date"]
+no_diff_columns = ["Year", "Month", "Day", "date",]
 kaggle_categorical_columns = numeric_categorical_columns + [
     string_categorical_column_prefix
 ]
@@ -112,6 +127,9 @@ def get_column_stats(df: pl.DataFrame | pl.LazyFrame):
             # Only min and max of categorical columns
             cat_col.min().prefix("min_"),
             cat_col.max().prefix("max_"),
+            (pl.col("date").max() - pl.col("date").min())
+            .dt.days()
+            .alias("days_from_first_to_last_payment"),
         ]
     )
 
@@ -176,14 +194,22 @@ def casting(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
             ]
         )
         .drop("S_2")
+        .sort(by=["customer_ID", "date"])
     )
 
-
+@overload
 def add_rank(df: pl.DataFrame) -> pl.DataFrame:
+    ...
+
+@overload
+def add_rank(df: pl.LazyFrame) -> pl.LazyFrame:
+    ...
+
+def add_rank(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
     return (
-        df.with_columns(
+        df.sort(by=["customer_ID", "date"]).with_columns(
             [
-                pl.count("customer_ID")
+                pl.count("date")
                 .over(pl.col("customer_ID"))
                 .cast(pl.UInt8)
                 .alias("total_number"),
@@ -194,8 +220,8 @@ def add_rank(df: pl.DataFrame) -> pl.DataFrame:
                 .alias("rank"),
             ]
         )
-        .with_column((pl.col("rank") - pl.col("total_number") + 13))
-        .drop("date")
+        .with_column((pl.col("rank") - pl.col("total_number") + 13).alias("rank"))
+        .sort(by=["customer_ID", "rank"])
     )
 
 
@@ -245,16 +271,16 @@ def rescale_rank(
 
 
 @overload
-def process(df: pl.DataFrame) -> pl.DataFrame:
+def add_full_ranks(df: pl.DataFrame) -> pl.DataFrame:
     ...
 
 
 @overload
-def process(df: pl.LazyFrame) -> pl.LazyFrame:
+def add_full_ranks(df: pl.LazyFrame) -> pl.LazyFrame:
     ...
 
 
-def process(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
+def add_full_ranks(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
     df = add_rank(df)
     ranks = pl.Series("rank", range(1, 14), dtype=pl.UInt8).to_frame()
     if isinstance(df, pl.LazyFrame):
@@ -272,11 +298,20 @@ def process(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
         df_full.join(df, on=["customer_ID", "rank"], how="outer")
         .select(pl.all().exclude(["count"]))
         .sort(
-            by="customer_ID",
+            by=["customer_ID", "rank"],
         )
     )
 
     return df_full
+
+@overload
+def diff_ratio(df: pl.DataFrame) -> pl.DataFrame:
+    ...
+
+
+@overload
+def diff_ratio(df: pl.LazyFrame) -> pl.LazyFrame:
+    ...
 
 
 def diff_ratio(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
@@ -329,8 +364,35 @@ def alternative_diff_ratio(df: pl.DataFrame) -> pl.DataFrame:
     )
     return df
 
+def diff_dates(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_column(
+        pl.col("date")
+        .diff()
+        .dt.days()
+        .over("customer_ID")
+            .alias("days_since_last_payment"),
+    ).drop("date")
 
-def filter_data(df: pl.DataFrame, fill_null=False) -> pl.DataFrame:
+def after_pay(df: pl.DataFrame) -> pl.DataFrame:
+    bcols = ["B_11", "B_14", "B_17", "D_39", "D_131", "S_16", "S_23"]
+    pcols = ['P_2','P_3']
+
+    exprs = []
+    for b in bcols:
+        for p in pcols:
+            exprs.append((pl.col(b) - pl.col(p)).alias(f"{b}-{p}"))
+    return df.with_columns(exprs)
+
+@overload
+def filter_data(df: pl.DataFrame, fill_null: bool=False) -> pl.DataFrame:
+    ...
+
+
+@overload
+def filter_data(df: pl.LazyFrame, fill_null: bool=False) -> pl.LazyFrame:
+    ...
+
+def filter_data(df: pl.DataFrame | pl.LazyFrame, fill_null: bool=False) -> pl.DataFrame | pl.LazyFrame:
     # Exclude the first diff/ratio, as it is always null
     df = df.select(
         pl.all().exclude(r"^(?:diff_)(.*)(?:_1)$").exclude(r"^(?:ratio_)(.*)(?:_1)$")
@@ -396,25 +458,6 @@ def pivot(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def split_df_into(
-    df: pl.DataFrame,
-    filepath: str = "artifacts/train_ratio_part_{:02d}.parquet",
-) -> list[int]:
-
-    raise ValueError("This code splits it randomly!")
-    total_length = len(df)
-
-    indices = [0]
-    index = 0
-    while index < total_length:
-        index += 20000 * 13
-        indices.append(index)
-
-    for i, (i1, i2) in enumerate(zip(indices, indices[1:])):
-        df[i1:i2].to_parquet(filepath.format(i))
-    return indices
-
-
 def add_index(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
     return df.with_column(pl.lit(1).alias("index")).with_column(
         pl.col("index").cumsum()
@@ -429,71 +472,65 @@ def hstack_lazy(
     return df1.join(df2, on="index").drop("index")
 
 
-@overload
 def run(
-    df,
+    df: pl.DataFrame | pl.LazyFrame,
     target=None,
-    fill_null: bool = True,
+    fill_null: bool = False,
     encode: bool = True,
     use_hash: bool = False,
     train_test: bool = False,
+    load_encoders: bool = False
 ) -> pl.DataFrame:
-    ...
-
-
-@overload
-def run(
-    df,
-    target=None,
-    fill_null: bool = True,
-    encode: bool = True,
-    use_hash: bool = False,
-    train_test: bool = True,
-) -> Tuple[pl.DataFrame, pl.DataFrame]:
-    ...
-
-
-def run(
-    df: pl.DataFrame,
-    target=None,
-    fill_null: bool = True,
-    encode: bool = True,
-    use_hash: bool = False,
-    train_test: bool = True,
-) -> pl.DataFrame | Tuple[pl.DataFrame, pl.DataFrame]:
+    print(yellow + "LET'S GO!")
+    # 1. CAST
     df = casting(df)
+    # 2. EXTRACT STATS
     df_stats = get_column_stats(df)
-    df = process(df)
+    # ADD 13 RANKS TO ALL
+    df = add_full_ranks(df)
+
+    # Add diff to date features
+    df = diff_dates(df)
+
+    # Add payment features
+    df = after_pay(df)
+
+    # ADD DIFF AND RATIO FEATURES
     df = diff_ratio(df)
-    assert not (encode and use_hash), "don't use encode and use_hash together"
+
+    assert not (encode and use_hash), red + "don't use encode and use_hash together"
 
     if use_hash:
         print("hashing")
         df = hash_columns(df)
+    # REMOVE BAD ROWS BEFORE PIVOT
     df = filter_data(df, fill_null=fill_null)
-
+    
     if isinstance(df, pl.LazyFrame):
         print("Collecting before pivot!")
         df = df.collect()
         df_stats = df_stats.collect()
 
-    print("Pivoting!")
+    # PIVOT DATA
+    print(blue + "Pivoting!")
     df = pivot(df)
 
-    print("Joining")
+    # JOIN STATS ON PIVOTED DATA
     df = df.join(df_stats, on="customer_ID")
     if target:
         df = df.join(target, on="customer_ID", how="left")
 
+    
+    # ENCODE CATEGORICALS
     if encode:
-        print("encoding categoricals as float")
+        print(blue + "Encoding categoricals as float")
         # df = encode_columns(df)
-        df = sklearn_encoder(df)
+        df = sklearn_encoder(df, load_encoders=load_encoders)
 
     # Cast to float32
     df = df.with_column(pl.col(pl.Float64).cast(pl.Float32))
 
-    print("Finished run!")
+    print(green + "Finished run!")
     if train_test:
         df_train, df_test = train_test_split(df)
         return df_train, df_test
@@ -583,9 +620,19 @@ def lgbm_metric(
     preds: np.ndarray, train_data: "lgb.Dataset"
 ) -> Tuple[str, float, bool]:
     # Final boolean is whether or not to maximize metric
+    # preds = np.rint(np.clip(preds, 0, 1))
     target: np.ndarray = train_data.get_label()
     return ("amex", amex_metric_numpy(preds, target), True)
 
+
+def lgbm_metric_expit(
+    preds: np.ndarray, train_data: "lgb.Dataset"
+) -> Tuple[str, float, bool]:
+    preds = special.expit(preds)
+    return lgbm_metric(preds, train_data)
+
+def predict(model, X):
+    return special.expit(model.predict(X))
 
 def xgboost_metric(predt: np.ndarray, dtrain: xgb.DMatrix) -> Tuple[str, float]:
     return ("amex", amex_metric_np(preds=predt, target=dtrain.get_label()))
@@ -662,7 +709,7 @@ def cv(dtrain, param: Optional[dict] = None):
     return mean
 
 
-def encode_categoricals(df, astype_category: bool = False):
+def encode_categoricals(df, astype_category: bool = False, load_encoders: bool = False):
     categorical_columns = get_categorical_columns(df)
 
     categorical_columns_numeric = [
@@ -672,8 +719,12 @@ def encode_categoricals(df, astype_category: bool = False):
         col for col in categorical_columns if col.startswith("diff_cat")
     ]
 
-    enc_numeric = preprocessing.OrdinalEncoder(dtype=np.int32, encoded_missing_value=-1)
-    enc_string = preprocessing.OrdinalEncoder(dtype=np.int32, encoded_missing_value=-1)
+    if load_encoders:
+        enc_numeric = joblib.load("enc_numeric")
+        enc_string = joblib.load("enc_string")
+    else:
+        enc_numeric = preprocessing.OrdinalEncoder(dtype=np.int32, encoded_missing_value=-1)
+        enc_string = preprocessing.OrdinalEncoder(dtype=np.int32, encoded_missing_value=-1)
 
     df.loc[:, categorical_columns_numeric] = enc_numeric.fit_transform(
         df[categorical_columns_numeric]
@@ -681,6 +732,10 @@ def encode_categoricals(df, astype_category: bool = False):
     df.loc[:, categorical_columns_string] = enc_string.fit_transform(
         df[categorical_columns_string]
     )
+
+    if not load_encoders:
+        enc_numeric = joblib.dump(enc_numeric, "enc_numeric")
+        enc_string = joblib.dump(enc_string, "enc_string")
 
     if astype_category:
         df = df.astype({col: "category" for col in categorical_columns})
@@ -691,14 +746,192 @@ def assert_equal(df1: pl.DataFrame, df2: pl.DataFrame):
     assert np.array_equal(df1.to_numpy(), df2.to_numpy())
 
 
-def sklearn_encoder(df: pl.DataFrame) -> pl.DataFrame:
-    enc = OrdinalEncoder(dtype=np.float32, encoded_missing_value=np.nan)
+def sklearn_encoder(df: pl.DataFrame, load_encoders: bool = False) -> pl.DataFrame:
     df_categorical = df.select(get_categorical_columns(df))
     data = df_categorical.to_numpy()
-    transformed = enc.fit_transform(data)
-
+    
+    if load_encoders:
+        enc = joblib.load("enc")
+    else:
+        enc = OrdinalEncoder(dtype=np.float32, encoded_missing_value=np.nan)
+        enc.fit(data)
+        joblib.dump(enc, "enc")
+    
+    transformed = enc.transform(data)
+    
     series_transformed = [
         pl.Series(name=name, values=transformed[:, i], dtype=pl.Float32)
         for i, name in enumerate(df_categorical.columns)
     ]
     return df.with_columns(series_transformed)
+
+def split_df_near_index(df: pl.DataFrame, near_index: int) -> int:
+    customers = df.select(pl.col("customer_ID"))
+    while customers[near_index, 0] == customers[near_index - 1, 0]:
+        near_index = near_index + 1
+    return near_index
+    
+def split_train_75_25():
+    # split train data into 75 and 25 parts
+    df = pl.read_parquet("artifacts/train.parquet")
+
+    split_index = int(len(df) * 0.75)
+    split_index = split_df_near_index(df, split_index)
+
+    df_75 = df[:split_index]
+    df_25 = df[split_index:]
+
+    df_75.to_parquet("artifacts/train_75.parquet")
+    df_25.to_parquet("artifacts/train_25.parquet")
+
+    return df_75, df_25
+
+
+def load_train_75():
+    return pl.scan_parquet("artifacts/train_75.parquet")
+
+def normalize_cumsum(df: pl.DataFrame, column: str) -> pl.DataFrame:
+    return df.sort(by=column, reverse=True).with_column((pl.col(column) / pl.col(column).sum()).cumsum())
+
+
+def get_cv_importance(cv_boosters: "lgb.CVBooster"):
+    importance_gain = cv_boosters.feature_importance("gain")
+    importance_split = cv_boosters.feature_importance("split")
+
+    columns = cv_boosters.feature_name()[0]
+    importance = (
+        [pl.Series("columns", columns)]
+        + [pl.Series(f"gain_cv_{i:02}", imp) for i, imp in enumerate(importance_gain)]
+        + [pl.Series(f"split_cv_{i:02}", imp) for i, imp in enumerate(importance_split)]
+        )
+
+    df_importance = pl.DataFrame(importance)
+
+    df_importance = df_importance.hstack(df_importance.select(pl.col(r"^gain_cv_.*$")).select(pl.fold(acc=pl.lit(0), f=lambda acc, x: acc + x, exprs=pl.col("*")).alias("gain_cumsum")))
+    df_importance = df_importance.hstack(df_importance.select(pl.col(r"^split_cv_.*$")).select(pl.fold(acc=pl.lit(0), f=lambda acc, x: acc + x, exprs=pl.col("*")).alias("split_cumsum")))
+
+    df_importance = normalize_cumsum(df_importance, "gain_cumsum")
+    df_importance = normalize_cumsum(df_importance, "split_cumsum")
+
+    df_importance = df_importance.with_columns([
+        (pl.col("gain_cumsum") < 0.999).alias("gain_0.999"),
+        (pl.col("split_cumsum") < 0.999).alias("split_0.999"),]
+    )
+    df_importance = df_importance.sort(by="gain_cumsum")
+    return df_importance
+
+
+# # polars
+# if "target" in df.columns:
+#     df_target = df.select(["customer_ID", "target"])
+#     df_target.to_parquet(f"{FOLDER}/target.parquet")
+#     target = df.select("target").to_series().to_pandas()
+#     df = df.drop("target")
+
+
+
+
+def binary_crossentropy_grad_hess() -> Tuple[Tuple[Symbol, Symbol, Symbol], Tuple[Expr, Expr, Expr]]:
+    y, p, eps = symbols("y, p, epsilon")
+    binary_cross = y*sp.log(p + eps) + (1-y+eps)*sp.log(1-p + eps)
+    grad = sp.diff(binary_cross, p)
+    hess = sp.diff(grad, p)
+    return (y, p, eps), (binary_cross, grad, hess)
+    
+def binary_crossentropy_as_numpy() -> Tuple[Callable, Callable, Callable]:
+    "All take arguments in the order `f(target, pred)`"
+    (y, p, eps), (binary_cross, grad, hess) = binary_crossentropy_grad_hess()
+
+    f_binary_cross = sp.lambdify((y, p, eps), binary_cross,)
+    f_grad = sp.lambdify((y, p, eps), grad)
+    f_hess = sp.lambdify((y, p, eps), hess)
+    return (f_binary_cross, f_grad, f_hess)
+
+_, f_grad, f_hess = binary_crossentropy_as_numpy()
+
+def numpy_grad(target, pred):
+    return (1 - target)/(1 - pred) + target / pred
+
+def numpy_hess(target, pred):
+    return (1-target) / (1-pred)**2 - target/pred**2
+
+def lgbm_bin_cross_objective(y: np.ndarray, data: lgb.Dataset) -> Tuple[np.ndarray, np.ndarray]:
+    target = data.get_label()
+    pred = y
+    EPS = 1e-7
+    pred = np.clip(pred, EPS, 1 - EPS)
+    # grad = numpy_grad(target, pred)
+    # hess = numpy_hess(target, pred)
+    grad = f_grad(target, pred, EPS)
+    hess = f_hess(target, pred, EPS)
+    return grad, hess
+
+def lgbm_bin_cross_objective2(y: np.ndarray, data: lgb.Dataset) -> Tuple[np.ndarray, np.ndarray]:
+    target = data.get_label()
+    pred = y
+    pred = special.expit(y)
+    # EPS = 1e-7
+    # pred = np.clip(pred, EPS, 1 - EPS)
+    # grad = numpy_grad(target, pred)
+    # hess = numpy_hess(target, pred)
+    grad = pred - target
+    hess = pred * (1-pred)
+    return grad, hess
+
+
+
+
+def lgb_cross_beta_func(beta: float):
+    def grad(pred, target, beta):
+        return -beta*pred*(target - 1) + target*(pred - 1)
+    
+    def hessian(pred, target, beta):
+        return pred*(pred - 1) * (beta*(target-1)-target)
+
+    def lgbm_bin_cross_objective_beta(pred: np.ndarray, data: lgb.Dataset) -> Tuple[np.ndarray, np.ndarray]:
+        target: np.ndarray = data.get_label()
+        pred = special.expit(pred)
+
+        grad = pred*(beta -beta*target + target) - target
+        hess = (target + beta - beta*target )*pred*(1-pred)
+        return grad, hess
+    return lgbm_bin_cross_objective_beta
+
+
+
+# # This cell tested a custom objective function. Takeaways are:
+# # - no gain, even for small beta values
+# # - use of custom objective in lightgbm and xgboost means that prediction values must
+# # be transformed by f(x) = 1 / (1 + exp(-x)) sigmoid function
+# # - we also had to pass `feval=lgbm_metric_expit,` to train!
+
+# catcol = get_categorical_columns(df_train)
+# train_data = lgb.Dataset(df_train, label=target, categorical_feature=catcol, free_raw_data=False)
+# valid_data = lgb.Dataset(df_valid, label=valid_target, categorical_feature=catcol, reference=train_data, free_raw_data=False)
+
+# scores = {}
+# cms = {}
+# numbers = np.linspace(1,4,8)[1:]
+# betas = (1/numbers)[::-1].tolist() + [1] + numbers.tolist()
+# for beta in betas:
+#     param = {
+#         "objective": lgb_cross_beta_func(beta),
+#         "gpu_device_id": 0,
+#         "device": "cuda_exp",
+#         "metric": "None",
+#     }
+#     model = lgb.train(
+#         param,
+#         num_boost_round=30,
+#         train_set=train_data,
+#         valid_sets=[valid_data],
+#         feval=lgbm_metric_expit,
+#         callbacks=[lgb.early_stopping(10)],
+#     )
+#     scores[f"{beta}"] = model.best_score["valid_0"]["amex"]
+#     cms[f"{beta}"] = confusion_matrix(valid_target,np.rint(model.predict(df_valid)))
+#     print(scores[f"{beta}"])
+
+# import matplotlib.pyplot as plt
+# x = np.linspace(-(len(scores) - 1)//2, (len(scores) - 1)//2, len(scores))
+# plt.plot(x, scores.values())
