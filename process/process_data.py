@@ -9,16 +9,19 @@ import pandas as pd
 import polars as pl
 import sympy as sp
 import xgboost as xgb
+
+from xgboost.callback import EarlyStopping
+
 from sklearn import preprocessing
 from sklearn.preprocessing import OrdinalEncoder
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sympy.core import Expr, Symbol, symbols
 from scipy import special
 try:
-    raise ImportError
     from rich import print
-    blue = "[bold #00b8ff]"
-    red = "[bold #ff0024]"
-    green = "[bold #0ef139]"
+    blue = "\t[bold #00b8ff]"
+    red = "\t[bold #ff0024]"
+    green = "\t[bold #0ef139]"
     yellow = "[bold #fbf704]"
 except ImportError:
     blue = "\t"
@@ -479,7 +482,9 @@ def run(
     encode: bool = True,
     use_hash: bool = False,
     train_test: bool = False,
-    load_encoders: bool = False
+    load_encoders: bool = False,
+    handle_unknown_encodings: bool = False,
+    drop_customer_ID: bool = True
 ) -> pl.DataFrame:
     print(yellow + "LET'S GO!")
     # 1. CAST
@@ -519,24 +524,21 @@ def run(
     df = df.join(df_stats, on="customer_ID")
     if target:
         df = df.join(target, on="customer_ID", how="left")
-
     
     # ENCODE CATEGORICALS
     if encode:
         print(blue + "Encoding categoricals as float")
         # df = encode_columns(df)
-        df = sklearn_encoder(df, load_encoders=load_encoders)
+        df = sklearn_encoder(df, load_encoders=load_encoders, handle_unknown_encodings = handle_unknown_encodings)
 
     # Cast to float32
     df = df.with_column(pl.col(pl.Float64).cast(pl.Float32))
 
-    print(green + "Finished run!")
-    if train_test:
-        df_train, df_test = train_test_split(df)
-        return df_train, df_test
 
-    else:
-        return df
+    if drop_customer_ID:
+        df = df.drop("customer_ID")
+
+    return df
 
 
 def train_test_split(
@@ -559,7 +561,7 @@ def train_test_split(
 
 
 def save(df: pl.DataFrame | pd.DataFrame, label: str):
-    df.to_parquet(f"data/{label}.parquet")
+    df.write_parquet(f"data/{label}.parquet")
 
 
 @overload
@@ -623,6 +625,14 @@ def lgbm_metric(
     # preds = np.rint(np.clip(preds, 0, 1))
     target: np.ndarray = train_data.get_label()
     return ("amex", amex_metric_numpy(preds, target), True)
+
+def lgbm_metric_round(
+    preds: np.ndarray, train_data: "lgb.Dataset"
+) -> Tuple[str, float, bool]:
+    # Final boolean is whether or not to maximize metric
+    # preds = np.rint(np.clip(preds, 0, 1))
+    target: np.ndarray = train_data.get_label()
+    return ("amex", amex_metric_numpy(np.rint(preds), target), True)
 
 
 def lgbm_metric_expit(
@@ -746,17 +756,21 @@ def assert_equal(df1: pl.DataFrame, df2: pl.DataFrame):
     assert np.array_equal(df1.to_numpy(), df2.to_numpy())
 
 
-def sklearn_encoder(df: pl.DataFrame, load_encoders: bool = False) -> pl.DataFrame:
+def sklearn_encoder(df: pl.DataFrame, load_encoders: bool = False, handle_unknown_encodings: bool = False) -> pl.DataFrame:
     df_categorical = df.select(get_categorical_columns(df))
     data = df_categorical.to_numpy()
     
-    if load_encoders:
-        enc = joblib.load("enc")
-    else:
-        enc = OrdinalEncoder(dtype=np.float32, encoded_missing_value=np.nan)
+    if not load_encoders:
+        print(red + "Creating new Categorical Feature Encodings!")
+        enc = OrdinalEncoder(dtype=np.float32, encoded_missing_value=np.nan, )
         enc.fit(data)
-        joblib.dump(enc, "enc")
+        joblib.dump(enc, "categorical_feature_encodings")
+    else:
+        print(red + "Loading Encodings for Categorical Features!")
+        enc = joblib.load("categorical_feature_encodings")
     
+    if handle_unknown_encodings:
+        enc.handle_unknown = 'use_encoded_value'
     transformed = enc.transform(data)
     
     series_transformed = [
@@ -781,8 +795,8 @@ def split_train_75_25():
     df_75 = df[:split_index]
     df_25 = df[split_index:]
 
-    df_75.to_parquet("artifacts/train_75.parquet")
-    df_25.to_parquet("artifacts/train_25.parquet")
+    df_75.write_parquet("artifacts/train_75.parquet")
+    df_25.write_parquet("artifacts/train_25.parquet")
 
     return df_75, df_25
 
@@ -824,7 +838,7 @@ def get_cv_importance(cv_boosters: "lgb.CVBooster"):
 # # polars
 # if "target" in df.columns:
 #     df_target = df.select(["customer_ID", "target"])
-#     df_target.to_parquet(f"{FOLDER}/target.parquet")
+#     df_target.write_parquet(f"{FOLDER}/target.parquet")
 #     target = df.select("target").to_series().to_pandas()
 #     df = df.drop("target")
 
@@ -899,6 +913,156 @@ def lgb_cross_beta_func(beta: float):
 
 
 
+def xgb_cross_validation(X: np.ndarray, y: np.ndarray, params: dict, early_stopping_rounds: int = 30):
+    FOLDS = 5
+
+    if isinstance(X, pd.DataFrame):
+        feature_importance =  {col:0 for col in X.columns}
+    else:
+        feature_importance = {f'f{i}':0 for i in range(X.shape[1])}
+
+    results = {"scores": [], "models": [], "feature_importances": []}
+    for fold, (train_indices, test_indices) in enumerate(
+        StratifiedKFold(FOLDS).split(X, y)
+    ):
+        X_train, y_train = X[train_indices], y[train_indices]
+        X_test, y_test = X[test_indices], y[test_indices]
+
+        dtrain = xgb.DMatrix(X_train, y_train)
+        dtest = xgb.DMatrix(X_test, y_test)
+
+        bst = xgb.train(
+            params,
+            dtrain=dtrain,
+            evals=[(dtest, "valid")],
+            custom_metric=xgboost_metric,
+            callbacks=[EarlyStopping(rounds=early_stopping_rounds)],
+        )
+        preds = bst.predict(dtest)
+        score = xgboost_metric(preds, dtest)[1]
+        results["scores"].append(score)
+        results["models"].append(bst)
+        results["feature_importances"].append(feature_importance | bst.get_score(importance_type='gain'))
+
+    results["score_mean"] = np.mean(results["scores"])
+    results["score_std"] = np.std(results["scores"])
+    results["feature_importances"] = [list(cols.values()) for cols in results["feature_importances"]]
+    results["feature_importance"] = np.mean(results["feature_importances"], axis=0)
+
+    return results
+
+
+def lgb_cross_validation(X, y, params = {'importance_type':'gain'}, early_stopping_rounds=30):
+    FOLDS = 5
+
+    results = {"scores":[], "models":[], "feature_importances":[]}
+    for fold, (train_indices, test_indices) in enumerate(StratifiedKFold(FOLDS).split(X, y)):
+        X_train, y_train = X[train_indices], y[train_indices]
+        X_test, y_test = X[test_indices], y[test_indices]
+
+        model = lgb.sklearn.LGBMClassifier(**params)
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], callbacks=[lgb.early_stopping(early_stopping_rounds), lgb.log_evaluation(-1)])
+
+        results["scores"].append(model.score(X_test, y_test))
+        results["models"].append(model)
+        results["feature_importances"].append(model.feature_importances_)
+
+    results['score_mean'] = np.mean(results["scores"])
+    results['score_std'] = np.std(results["scores"])
+    results['feature_importance'] = np.mean(results["feature_importances"], axis=0)
+
+    return results
+
+
+def feature_elimination_xgboost(df: pd.DataFrame, target: pd.Series, columns: list) -> Tuple[float, np.ndarray]:
+        catcol = get_categorical_xgboost(df)
+
+        train_data = xgb.DMatrix(df, label=target, enable_categorical=True, feature_types=catcol)
+
+        param = {
+            "objective": "binary",
+            "gpu_device_id": 0,
+            "device": "cuda_exp",
+            "metric": "None",
+            "custom_metric":xgboost_metric,
+            "maximize":True,
+        }
+        results: pd.DataFrame = xgb.train(
+            param, train_data, 
+            num_boost_round=1000,
+            folds=StratifiedKFold(5),
+            early_stopping_rounds=20, 
+            )
+
+        score = results["test-amex-mean"][-1]
+
+        feature_importances = np.sum(cv_boosters.feature_importance(), axis=0)
+        return score, feature_importances
+
+def feature_elimination_lightgbm(df: pd.DataFrame, target: pd.Series, columns: list) -> Tuple[float, np.ndarray]:
+        df = df.loc[:, columns]
+        print(green + f"Using {len(columns)} columns!")
+        
+        catcol = get_categorical_columns(df)
+
+        train_data = lgb.Dataset(df, label=target, categorical_feature=catcol)
+
+        param = {
+            "objective": "binary",
+            "gpu_device_id": 0,
+            "device": "cuda_exp",
+            "metric": "None",
+        }
+        results = lgb.cv(
+            param,
+            train_set=train_data,
+            folds=StratifiedKFold(5),
+            num_boost_round=3,
+            feval=lgbm_metric,
+            callbacks=[lgb.early_stopping(33)],
+            return_cvbooster=True,
+        )
+
+        cv_boosters: lgb.CVBooster = results["cvbooster"]
+        score = np.mean(results["valid amex-mean"])
+        feature_importances = np.sum(cv_boosters.feature_importance(), axis=0)
+        return score, feature_importances
+
+def recursive_feature_elimination(df: pd.DataFrame) -> pl.DataFrame:
+    target = df["target"]
+    df = df.drop(columns="target")
+    print(f"[bold green]DataFrame has shape: [bold red]{df.shape}[bold green]![/bold green]")
+    score = 0
+    best_score = 0
+
+    SAVEPATH = "data"
+    SAVENAME = "feature_importance"
+    columns: list[str] = df.columns.to_list()
+
+    for i in range(10):
+        df = df.loc[:, columns]
+        print(green + f"Using {len(columns)} columns!")
+        score, feature_importances = feature_elimination_lightgbm(df, target, columns)
+        if score > best_score:
+            color = "bold green"
+            best_score = score
+        else:
+            color = "bold red"
+
+        print(blue + f"Mean score: {score:.4f}[/{color}]!")
+
+        df_importance = pl.DataFrame({"columns": df.columns.to_list(), "feature_importance": feature_importances})
+        df_importance = df_importance.sort(by="feature_importance", reverse=True)
+        df_importance.write_csv(f"{SAVEPATH}/{SAVENAME}_{i:02}.csv")
+
+        importances: list[str] = df_importance.select("columns").to_series().to_list()
+        fraction = 0.7
+        columns = importances[:int(fraction * df.shape[1])]
+
+        print(f"[bold yellow]Best score: {best_score:.4f}[/bold yellow]!")
+    print(f"[bold #1dfd02] saved in {SAVEPATH} as {SAVENAME} by iteration!")
+    return df_importance
+
 # # This cell tested a custom objective function. Takeaways are:
 # # - no gain, even for small beta values
 # # - use of custom objective in lightgbm and xgboost means that prediction values must
@@ -935,3 +1099,8 @@ def lgb_cross_beta_func(beta: float):
 # import matplotlib.pyplot as plt
 # x = np.linspace(-(len(scores) - 1)//2, (len(scores) - 1)//2, len(scores))
 # plt.plot(x, scores.values())
+
+from sklearn.metrics import make_scorer
+
+def make_amex_metric_sklearn():
+    return make_scorer(amex_metric_np, greater_is_better=True)
