@@ -623,17 +623,11 @@ def lgbm_metric(
 ) -> Tuple[str, float, bool]:
     # Final boolean is whether or not to maximize metric
     # preds = np.rint(np.clip(preds, 0, 1))
-    target: np.ndarray = train_data.get_label()
+    if isinstance(train_data, np.ndarray):
+        target = train_data
+    else:
+        target: np.ndarray = train_data.get_label()
     return ("amex", amex_metric_numpy(preds, target), True)
-
-def lgbm_metric_round(
-    preds: np.ndarray, train_data: "lgb.Dataset"
-) -> Tuple[str, float, bool]:
-    # Final boolean is whether or not to maximize metric
-    # preds = np.rint(np.clip(preds, 0, 1))
-    target: np.ndarray = train_data.get_label()
-    return ("amex", amex_metric_numpy(np.rint(preds), target), True)
-
 
 def lgbm_metric_expit(
     preds: np.ndarray, train_data: "lgb.Dataset"
