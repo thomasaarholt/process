@@ -443,6 +443,9 @@ def encode_columns(df, dtype=pl.UInt8) -> pl.DataFrame:
     )
 
 
+def nans_to_nulls(df: pl.DataFrame) -> pl.DataFrame:
+    return df.fill_nan(None)
+
 def pivot(df: pl.DataFrame) -> pl.DataFrame:
     column_names = df.columns[2:]
 
@@ -460,6 +463,16 @@ def pivot(df: pl.DataFrame) -> pl.DataFrame:
 
     return df
 
+def pivot_by_slice(df: pl.DataFrame) -> pl.DataFrame:
+    N_ROWS = len(df) // 13
+    ser_slices = [
+        s.slice(rank * N_ROWS, N_ROWS).alias(s.name + "_" + str(rank + 1))
+        for s in df.sort(["rank", "customer_ID"])[:, 2:]
+        for rank in range(0, 13)
+    ]
+
+    result = df.select(pl.col("customer_ID").sort().unique(maintain_order=True)).hstack(pl.DataFrame(ser_slices))
+    return result
 
 def add_index(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
     return df.with_column(pl.lit(1).alias("index")).with_column(
@@ -478,9 +491,14 @@ def hstack_lazy(
 def run(
     df: pl.DataFrame | pl.LazyFrame,
     target=None,
-    fill_null: bool = False,
+    add_stats: bool = True,
+    add_diff_dates: bool = True,
+    add_diffs: bool = True,
+    add_after_pay: bool = True,
+    run_filter: bool = True,
+    filter_fill_null: bool = False,
+    cast_f32: bool = True,
     encode: bool = True,
-    use_hash: bool = False,
     train_test: bool = False,
     load_encoders: bool = False,
     handle_unknown_encodings: bool = False,
@@ -490,55 +508,64 @@ def run(
     # 1. CAST
     df = casting(df)
     # 2. EXTRACT STATS
-    df_stats = get_column_stats(df)
-    # ADD 13 RANKS TO ALL
+    if add_stats:
+        df_stats = get_column_stats(df)
+
+    # Add ranks - might want to add these the other way
     df = add_full_ranks(df)
 
     # Add diff to date features
-    df = diff_dates(df)
+    if add_diff_dates:
+        df = diff_dates(df)
+    else:
+        df = df.drop("date")
 
     # Add payment features
-    df = after_pay(df)
+    if add_after_pay:
+        df = after_pay(df)
 
     # ADD DIFF AND RATIO FEATURES
-    df = diff_ratio(df)
+    if add_diffs:
+        df = diff_ratio(df)
 
-    assert not (encode and use_hash), red + "don't use encode and use_hash together"
-
-    if use_hash:
-        print("hashing")
-        df = hash_columns(df)
     # REMOVE BAD ROWS BEFORE PIVOT
-    df = filter_data(df, fill_null=fill_null)
+    if run_filter:
+        df = filter_data(df, fill_null=filter_fill_null)
     
     if isinstance(df, pl.LazyFrame):
         print("Collecting before pivot!")
         df = df.collect()
-        df_stats = df_stats.collect()
+        if add_stats:
+            df_stats = df_stats.collect()
 
     # PIVOT DATA
     print(blue + "Pivoting!")
-    df = pivot(df)
+
+    df = nans_to_nulls(df)
+
+    df = pivot_by_slice(df)
 
     # JOIN STATS ON PIVOTED DATA
-    df = df.join(df_stats, on="customer_ID")
+    if add_stats:
+        df = df.join(df_stats, on="customer_ID")
     if target:
         df = df.join(target, on="customer_ID", how="left")
     
     # ENCODE CATEGORICALS
     if encode:
         print(blue + "Encoding categoricals as float")
-        # df = encode_columns(df)
         df = sklearn_encoder(df, load_encoders=load_encoders, handle_unknown_encodings = handle_unknown_encodings)
 
     # Cast to float32
-    df = df.with_column(pl.col(pl.Float64).cast(pl.Float32))
-
+    if cast_f32:
+        df = df.with_column(pl.col(pl.Float64).cast(pl.Float32))
 
     if drop_customer_ID:
         df = df.drop("customer_ID")
 
     return df
+
+
 
 
 def train_test_split(
@@ -619,14 +646,13 @@ def split_frame(df: pl.DataFrame, n: int = 5):
 
 
 def lgbm_metric(
-    preds: np.ndarray, train_data: "lgb.Dataset"
+    preds: np.ndarray, target: "lgb.Dataset"
 ) -> Tuple[str, float, bool]:
-    # Final boolean is whether or not to maximize metric
-    # preds = np.rint(np.clip(preds, 0, 1))
-    if isinstance(train_data, np.ndarray):
-        target = train_data
-    else:
-        target: np.ndarray = train_data.get_label()
+    """NOTE THAT SKLEARN AND LGBM METRICS ARE SWAPPED!!!"""
+    return ("amex", amex_metric_numpy(preds, target.get_label()), True)
+
+def lgbm_sklearn_metric(target: np.ndarray, preds: np.ndarray) -> Tuple[str, float, bool]:
+    """NOTE THAT SKLEARN AND LGBM METRICS ARE SWAPPED!!!"""
     return ("amex", amex_metric_numpy(preds, target), True)
 
 def lgbm_metric_expit(
@@ -1098,3 +1124,79 @@ from sklearn.metrics import make_scorer
 
 def make_amex_metric_sklearn():
     return make_scorer(amex_metric_np, greater_is_better=True)
+
+# def run_old(
+#     df: pl.DataFrame | pl.LazyFrame,
+#     target=None,
+#     fill_null: bool = False,
+#     encode: bool = True,
+#     use_hash: bool = False,
+#     train_test: bool = False,
+#     load_encoders: bool = False,
+#     handle_unknown_encodings: bool = False,
+#     drop_customer_ID: bool = True
+# ) -> pl.DataFrame:
+#     print(yellow + "LET'S GO!")
+#     # 1. CAST
+#     df = casting(df)
+#     # 2. EXTRACT STATS
+#     df_stats = get_column_stats(df)
+#     # ADD 13 RANKS TO ALL
+#     df = add_full_ranks(df)
+
+#     # Add diff to date features
+#     df = diff_dates(df)
+
+#     # Add payment features
+#     df = after_pay(df)
+
+#     # ADD DIFF AND RATIO FEATURES
+#     df = diff_ratio(df)
+
+#     assert not (encode and use_hash), red + "don't use encode and use_hash together"
+
+#     if use_hash:
+#         print("hashing")
+#         df = hash_columns(df)
+#     # REMOVE BAD ROWS BEFORE PIVOT
+#     df = filter_data(df, fill_null=fill_null)
+    
+#     if isinstance(df, pl.LazyFrame):
+#         print("Collecting before pivot!")
+#         df = df.collect()
+#         df_stats = df_stats.collect()
+
+#     # PIVOT DATA
+#     print(blue + "Pivoting!")
+#     df = pivot(df)
+
+#     # JOIN STATS ON PIVOTED DATA
+#     df = df.join(df_stats, on="customer_ID")
+#     if target:
+#         df = df.join(target, on="customer_ID", how="left")
+    
+#     # ENCODE CATEGORICALS
+#     if encode:
+#         print(blue + "Encoding categoricals as float")
+#         # df = encode_columns(df)
+#         df = sklearn_encoder(df, load_encoders=load_encoders, handle_unknown_encodings = handle_unknown_encodings)
+
+#     # Cast to float32
+#     df = df.with_column(pl.col(pl.Float64).cast(pl.Float32))
+
+
+#     if drop_customer_ID:
+#         df = df.drop("customer_ID")
+
+#     return df
+
+class lightgbm_model_for_leshy(lgb.sklearn.LGBMClassifier):
+    "Needed this for custom metric to work! Dont need the early stopping though!"
+    def fit(self, X, y, sample_weight):
+        return super().fit(
+            X,
+            y,
+            # eval_set=[(X_valid, y_valid)],
+            eval_metric=lgbm_sklearn_metric,
+            # callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)],
+)
